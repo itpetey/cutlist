@@ -89,7 +89,7 @@ export function blankJob(): Job {
   }
 }
 
-const STORAGE_KEY = 'cutlist.job.v1'
+export const LEGACY_JOB_KEY = 'cutlist.job.v1'
 
 function isFiniteNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value)
@@ -137,7 +137,7 @@ export function normaliseJob(input: unknown): Job | null {
 export function loadJob(): Job {
   if (typeof localStorage === 'undefined') return sampleJob()
   try {
-    const raw = localStorage.getItem(STORAGE_KEY)
+    const raw = localStorage.getItem(LEGACY_JOB_KEY)
     if (!raw) return sampleJob()
     const parsed = normaliseJob(JSON.parse(raw))
     if (!parsed) return sampleJob()
@@ -148,17 +148,20 @@ export function loadJob(): Job {
   }
 }
 
-export function saveJob(job: Job): void {
-  if (typeof localStorage === 'undefined') return
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(job))
-  } catch {
-    // Storage may be unavailable (private mode); the app still works in memory.
-  }
-}
-
 export function jobKey(job: Job): string {
-  return JSON.stringify(job)
+  // Canonical, order-independent key. Property order must not matter: jobs are
+  // normalised on load, which can reorder object keys.
+  return JSON.stringify([
+    job.parts.map((p) => [p.id, p.label, p.length, p.qty]),
+    job.stocks.map((s) => [s.id, s.name, s.length, s.price, s.qty]),
+    [
+      job.settings.kerf,
+      job.settings.leftTrim,
+      job.settings.rightTrim,
+      job.settings.minRemnant,
+      job.settings.timeLimitMs,
+    ],
+  ])
 }
 
 const MM_TO_UM = 1000

@@ -15,6 +15,7 @@ const moneyCompact = new Intl.NumberFormat('en-AU', {
 const decimal0 = new Intl.NumberFormat('en-AU', { maximumFractionDigits: 0 })
 const decimal1 = new Intl.NumberFormat('en-AU', { maximumFractionDigits: 1 })
 const decimal2 = new Intl.NumberFormat('en-AU', { maximumFractionDigits: 2 })
+const timeOfDay = new Intl.DateTimeFormat('en-AU', { hour: '2-digit', minute: '2-digit' })
 
 export function formatMoney(cents: number): string {
   return money.format(cents / 100)
@@ -50,4 +51,8 @@ export function formatDuration(ms: number): string {
   if (!Number.isFinite(ms)) return '—'
   if (ms < 1000) return `${Math.round(ms)} ms`
   return `${decimal1.format(ms / 1000)} s`
+}
+
+export function formatTime(timestamp: number): string {
+  return timeOfDay.format(new Date(timestamp))
 }
