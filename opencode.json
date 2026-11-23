@@ -1,0 +1,14 @@
+{
+  "mcp": {
+    "servers": {
+      "rust-analyzer": {
+        "type": "local",
+        "command": ["rust-analyzer-mcp"]
+      },
+      "firecrawl": {
+        "type": "remote",
+        "url": "https://mcp.firecrawl.dev/v2/mcp-oauth"
+      }
+    }
+  }
+}

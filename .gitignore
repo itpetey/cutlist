@@ -1,0 +1,6 @@
+node_modules
+dist
+wasm/target
+.DS_Store
+*.local
+*.tsbuildinfo
