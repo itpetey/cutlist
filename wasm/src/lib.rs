@@ -16,12 +16,17 @@
 //! is exact. A result is marked `proven` only when the search completes without
 //! hitting its time or pattern limits.
 
+use std::{
+    cmp::Ordering,
+    collections::HashMap,
+    hash::{BuildHasherDefault, Hasher},
+};
+
 use js_sys::Date;
 use serde::{Deserialize, Serialize};
-use std::cmp::Ordering;
-use std::collections::HashMap;
-use std::hash::{BuildHasherDefault, Hasher};
 use wasm_bindgen::prelude::*;
+
+type Memo = HashMap<u128, (i64, i64, i64), BuildHasherDefault<U128Hasher>>;
 
 const DEFAULT_PATTERN_LIMIT: usize = 250_000;
 const MEMO_CAP: usize = 1_500_000;
@@ -163,33 +168,410 @@ struct Plan {
     offcut: i64,
 }
 
-fn now_ms() -> f64 {
-    Date::now()
+// ---------------------------------------------------------------------------
+// Pattern enumeration
+// ---------------------------------------------------------------------------
+
+struct Gen<'a> {
+    lens: &'a [i64],
+    demands: &'a [u32],
+    patterns: Vec<Pattern>,
+    stock: usize,
+    usable: i64,
+    kerf: i64,
+    counts: Vec<u32>,
+    limit: usize,
+    deadline: f64,
+    node_count: u32,
+    incomplete: bool,
+    cap_hit: bool,
+    cut_short: bool,
 }
 
-fn mode_name(mode: Objective) -> String {
-    match mode {
-        Objective::Price => "price".to_string(),
-        Objective::Waste => "waste".to_string(),
+// ---------------------------------------------------------------------------
+// Branch and bound
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct U128Hasher(u64);
+
+struct Search<'a> {
+    lens: &'a [i64],
+    patterns: &'a [Pattern],
+    by_part: &'a [Vec<usize>],
+    stocks: &'a [PrepStock],
+    mode: Objective,
+    kerf: i64,
+    trim: i64,
+    min_remnant: i64,
+    rem: Vec<u32>,
+    stock_left: Vec<Option<u32>>,
+    stack: Vec<(usize, usize)>,
+    best: Option<Plan>,
+    nodes: u64,
+    timed_out: bool,
+    aborted: bool,
+    deadline: f64,
+    ratio_order: Vec<usize>,
+    memo: Memo,
+    memo_enabled: bool,
+    rem_mult: Vec<u128>,
+    stock_mult: Vec<(usize, u128)>,
+}
+
+impl Gen<'_> {
+    /// Returns true when generation should stop.
+    fn walk(&mut self, start: usize, used: i64, pieces: u32) -> bool {
+        self.node_count = self.node_count.wrapping_add(1);
+
+        if self.patterns.len() >= self.limit {
+            self.incomplete = true;
+            self.cap_hit = true;
+            return true;
+        }
+        if self.node_count & 511 == 0 && now_ms() > self.deadline {
+            self.incomplete = true;
+            self.cut_short = true;
+            return true;
+        }
+
+        let m = self.lens.len();
+        let mut can_extend = false;
+        for i in 0..m {
+            if self.counts[i] >= self.demands[i] {
+                continue;
+            }
+            let add = (if pieces > 0 { self.kerf } else { 0 }) + self.lens[i];
+            if used + add <= self.usable {
+                can_extend = true;
+                break;
+            }
+        }
+
+        if !can_extend {
+            if pieces > 0 {
+                self.patterns.push(Pattern {
+                    stock: self.stock,
+                    counts: self.counts.clone(),
+                    pieces,
+                    used_um: used,
+                });
+            }
+            return false;
+        }
+
+        for i in start..m {
+            if self.counts[i] >= self.demands[i] {
+                continue;
+            }
+            let add = (if pieces > 0 { self.kerf } else { 0 }) + self.lens[i];
+            if used + add > self.usable {
+                continue;
+            }
+            self.counts[i] += 1;
+            let stop = self.walk(i, used + add, pieces + 1);
+            self.counts[i] -= 1;
+            if stop {
+                return true;
+            }
+        }
+        false
     }
 }
 
-fn stock_available(left: &Option<u32>) -> bool {
-    match left {
-        None => true,
-        Some(q) => *q > 0,
+impl Hasher for U128Hasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = 0xcbf29ce484222325u64;
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        self.0 = h;
+    }
+
+    fn write_u128(&mut self, value: u128) {
+        let mut x = (value as u64) ^ ((value >> 64) as u64).rotate_left(29);
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xff51afd7ed558ccd);
+        x ^= x >> 33;
+        self.0 = x;
     }
 }
 
-fn take_stock(left: &mut Option<u32>) {
-    if let Some(q) = left.as_mut() {
-        *q -= 1;
+impl Search<'_> {
+    fn stock_available(&self, si: usize) -> bool {
+        stock_available(&self.stock_left[si])
     }
-}
 
-fn give_stock(left: &mut Option<u32>) {
-    if let Some(q) = left.as_mut() {
-        *q += 1;
+    fn min_price_available(&self) -> Option<i64> {
+        self.stocks
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| self.stock_available(*i))
+            .map(|(_, s)| s.price_cents)
+            .min()
+    }
+
+    fn max_usable_available(&self) -> i64 {
+        self.stocks
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| self.stock_available(*i))
+            .map(|(_, s)| s.usable_um)
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn objective(&self, price: i64, length: i64, offcut: i64) -> (i64, i64, i64) {
+        match self.mode {
+            Objective::Price => (price, length, -offcut),
+            Objective::Waste => (length, price, -offcut),
+        }
+    }
+
+    fn is_better(&self, price: i64, length: i64, offcut: i64) -> bool {
+        let Some(best) = &self.best else {
+            return true;
+        };
+        let current = self.objective(price, length, offcut);
+        let stored = self.objective(best.price, best.length, best.offcut);
+        current < stored
+    }
+
+    /// Mixed-radix code of (remaining parts, remaining limited stock).
+    fn encode_state(&self) -> u128 {
+        let mut code = 0u128;
+        for i in 0..self.rem.len() {
+            let count = self.rem[i];
+            if count > 0 {
+                code += count as u128 * self.rem_mult[i];
+            }
+        }
+        for &(si, mult) in &self.stock_mult {
+            if let Some(q) = self.stock_left[si] {
+                if q > 0 {
+                    code += q as u128 * mult;
+                }
+            }
+        }
+        code
+    }
+
+    fn search(&mut self, acc_price: i64, acc_length: i64, acc_offcut: i64) {
+        self.nodes += 1;
+        if self.nodes & 127 == 0 && now_ms() > self.deadline {
+            self.timed_out = true;
+            self.aborted = true;
+            return;
+        }
+
+        let m = self.lens.len();
+        let mut pick: Option<usize> = None;
+        let mut rem_length: i64 = 0;
+        let mut rem_pieces: u64 = 0;
+        for i in 0..m {
+            let r = self.rem[i];
+            if r > 0 {
+                rem_pieces += r as u64;
+                rem_length += (r as i64) * self.lens[i];
+                if pick.is_none() || self.lens[i] > self.lens[pick.unwrap()] {
+                    pick = Some(i);
+                }
+            }
+        }
+
+        let Some(j) = pick else {
+            if self.is_better(acc_price, acc_length, acc_offcut) {
+                let patterns = self.patterns;
+                let boards = self
+                    .stack
+                    .iter()
+                    .map(|&(si, pi)| PlanBoard {
+                        stock: si,
+                        counts: patterns[pi].counts.clone(),
+                    })
+                    .collect();
+                self.best = Some(Plan {
+                    boards,
+                    price: acc_price,
+                    length: acc_length,
+                    offcut: acc_offcut,
+                });
+            }
+            return;
+        };
+
+        // Exact transposition table: reaching the same residual state with an
+        // equal or worse accumulated objective can never improve the answer.
+        if self.memo_enabled {
+            let code = self.encode_state();
+            let current = self.objective(acc_price, acc_length, acc_offcut);
+            match self.memo.get(&code).copied() {
+                Some(stored) => {
+                    if stored <= current {
+                        return;
+                    }
+                    self.memo.insert(code, current);
+                }
+                None => {
+                    if self.memo.len() < MEMO_CAP {
+                        self.memo.insert(code, current);
+                    }
+                }
+            }
+        }
+
+        // ---- bounds ------------------------------------------------------
+        let stocks = self.stocks;
+        let (primary_lb, secondary_lb) = match self.mode {
+            Objective::Price => {
+                let mut need = rem_length as f64;
+                let mut cost = 0.0f64;
+                for &si in &self.ratio_order {
+                    if need <= 0.0 {
+                        break;
+                    }
+                    if !self.stock_available(si) {
+                        continue;
+                    }
+                    let s = &stocks[si];
+                    let avail = match s.qty {
+                        None => need,
+                        Some(_) => self.stock_left[si].unwrap_or(0) as f64 * s.usable_um as f64,
+                    };
+                    let take = need.min(avail);
+                    cost += take * s.price_cents as f64 / s.usable_um as f64;
+                    need -= take;
+                }
+                if need > 1e-9 {
+                    return;
+                }
+                let Some(min_price) = self.min_price_available() else {
+                    return;
+                };
+                let max_usable = self.max_usable_available();
+                if max_usable <= 0 {
+                    return;
+                }
+                let board_lb = (rem_length as f64 / max_usable as f64).ceil();
+                (cost.max(board_lb * min_price as f64), rem_length as f64)
+            }
+            Objective::Waste => {
+                let max_usable = self.max_usable_available();
+                if max_usable <= 0 {
+                    return;
+                }
+                let board_lb = (rem_length as f64 / max_usable as f64).ceil() as i64;
+                let overhead = self.trim - self.kerf;
+                let best_boards = if overhead >= 0 {
+                    board_lb
+                } else {
+                    rem_pieces as i64
+                };
+                let kerfs = (rem_pieces as i64 - best_boards).max(0);
+                let primary = rem_length + self.kerf * kerfs + best_boards * self.trim;
+                let Some(min_price) = self.min_price_available() else {
+                    return;
+                };
+                (primary as f64, (board_lb * min_price) as f64)
+            }
+        };
+
+        let (total_price_lb, total_length_lb) = match self.mode {
+            Objective::Price => (
+                acc_price as f64 + primary_lb,
+                acc_length as f64 + secondary_lb,
+            ),
+            Objective::Waste => (
+                acc_price as f64 + secondary_lb,
+                acc_length as f64 + primary_lb,
+            ),
+        };
+
+        if let Some(best) = &self.best {
+            let bp = best.price as f64;
+            let bl = best.length as f64;
+            match self.mode {
+                Objective::Price => {
+                    if total_price_lb > bp + 1e-6 {
+                        return;
+                    }
+                    if (total_price_lb - bp).abs() < 1e-6 && total_length_lb > bl + 1e-6 {
+                        return;
+                    }
+                }
+                Objective::Waste => {
+                    if total_length_lb > bl + 1e-6 {
+                        return;
+                    }
+                    if (total_length_lb - bl).abs() < 1e-6 && total_price_lb > bp + 1e-6 {
+                        return;
+                    }
+                }
+            }
+        }
+
+        let patterns = self.patterns;
+        let by_part = self.by_part;
+        let list = &by_part[j];
+
+        for pos in 0..list.len() {
+            let pi = list[pos];
+            let p = &patterns[pi];
+            let stock = &stocks[p.stock];
+            if !self.stock_available(p.stock) {
+                continue;
+            }
+
+            let counts = &p.counts;
+            let mut fits = true;
+            for i in 0..m {
+                if counts[i] > self.rem[i] {
+                    fits = false;
+                    break;
+                }
+            }
+            if !fits {
+                continue;
+            }
+
+            for i in 0..m {
+                if counts[i] > 0 {
+                    self.rem[i] -= counts[i];
+                }
+            }
+            take_stock(&mut self.stock_left[p.stock]);
+            self.stack.push((p.stock, pi));
+
+            let board_offcut = stock.usable_um - p.used_um;
+            let added_offcut = if board_offcut >= self.min_remnant && board_offcut > 0 {
+                board_offcut
+            } else {
+                0
+            };
+
+            self.search(
+                acc_price + stock.price_cents,
+                acc_length + stock.length_um,
+                acc_offcut + added_offcut,
+            );
+
+            self.stack.pop();
+            give_stock(&mut self.stock_left[p.stock]);
+            for i in 0..m {
+                if counts[i] > 0 {
+                    self.rem[i] += counts[i];
+                }
+            }
+
+            if self.aborted {
+                return;
+            }
+        }
     }
 }
 
@@ -203,6 +585,122 @@ pub fn solve(input_json: &str) -> Result<String, JsValue> {
         .map_err(|e| JsValue::from_str(&format!("Invalid solver input: {e}")))?;
     let result = run(input);
     serde_json::to_string(&result).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+fn give_stock(left: &mut Option<u32>) {
+    if let Some(q) = left.as_mut() {
+        *q += 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Greedy incumbent
+// ---------------------------------------------------------------------------
+
+fn greedy_plan(
+    lens: &[i64],
+    demands: &[u32],
+    stocks: &[PrepStock],
+    kerf: i64,
+    min_remnant: i64,
+    mode: Objective,
+) -> Option<Plan> {
+    let m = lens.len();
+    let mut rem = demands.to_vec();
+    let mut left: Vec<Option<u32>> = stocks.iter().map(|s| s.qty).collect();
+    let mut part_order: Vec<usize> = (0..m).collect();
+    part_order.sort_by(|&a, &b| lens[b].cmp(&lens[a]));
+
+    let mut boards: Vec<PlanBoard> = Vec::new();
+    let mut price = 0i64;
+    let mut length = 0i64;
+    let mut offcut_total = 0i64;
+    let mut left_pieces: u64 = demands.iter().map(|&q| q as u64).sum();
+    let guard_limit = left_pieces + 10;
+    let mut guard = 0u64;
+
+    while left_pieces > 0 {
+        guard += 1;
+        if guard > guard_limit {
+            return None;
+        }
+
+        let mut choice: Option<(usize, Vec<u32>, i64)> = None;
+        let mut choice_score = f64::INFINITY;
+
+        for si in 0..stocks.len() {
+            if !stock_available(&left[si]) {
+                continue;
+            }
+            let stock = &stocks[si];
+            let mut counts = vec![0u32; m];
+            let mut temp = rem.clone();
+            let mut used = 0i64;
+            let mut pieces = 0u32;
+            let mut parts_um = 0i64;
+
+            for &i in &part_order {
+                while temp[i] > 0 {
+                    let add = (if pieces > 0 { kerf } else { 0 }) + lens[i];
+                    if used + add > stock.usable_um {
+                        break;
+                    }
+                    counts[i] += 1;
+                    pieces += 1;
+                    used += add;
+                    parts_um += lens[i];
+                    temp[i] -= 1;
+                }
+            }
+            if pieces == 0 {
+                continue;
+            }
+
+            let primary = if mode == Objective::Price {
+                stock.price_cents
+            } else {
+                stock.length_um
+            };
+            let score = primary as f64 / parts_um as f64;
+            if score < choice_score {
+                choice_score = score;
+                choice = Some((si, counts, used));
+            }
+        }
+
+        let (si, counts, used) = choice?;
+        for i in 0..m {
+            rem[i] -= counts[i];
+        }
+        let pieces: u32 = counts.iter().sum();
+        left_pieces -= pieces as u64;
+        take_stock(&mut left[si]);
+        price += stocks[si].price_cents;
+        length += stocks[si].length_um;
+        let board_offcut = stocks[si].usable_um - used;
+        if board_offcut >= min_remnant && board_offcut > 0 {
+            offcut_total += board_offcut;
+        }
+        boards.push(PlanBoard { stock: si, counts });
+    }
+
+    Some(Plan {
+        boards,
+        price,
+        length,
+        offcut: offcut_total,
+    })
+}
+
+fn mode_name(mode: Objective) -> String {
+    match mode {
+        Objective::Price => "price".to_string(),
+        Objective::Waste => "waste".to_string(),
+    }
+}
+
+fn now_ms() -> f64 {
+    Date::now()
 }
 
 fn run(input: SolverInput) -> SolveResult {
@@ -676,510 +1174,15 @@ fn run(input: SolverInput) -> SolveResult {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Pattern enumeration
-// ---------------------------------------------------------------------------
-
-struct Gen<'a> {
-    lens: &'a [i64],
-    demands: &'a [u32],
-    patterns: Vec<Pattern>,
-    stock: usize,
-    usable: i64,
-    kerf: i64,
-    counts: Vec<u32>,
-    limit: usize,
-    deadline: f64,
-    node_count: u32,
-    incomplete: bool,
-    cap_hit: bool,
-    cut_short: bool,
-}
-
-impl Gen<'_> {
-    /// Returns true when generation should stop.
-    fn walk(&mut self, start: usize, used: i64, pieces: u32) -> bool {
-        self.node_count = self.node_count.wrapping_add(1);
-
-        if self.patterns.len() >= self.limit {
-            self.incomplete = true;
-            self.cap_hit = true;
-            return true;
-        }
-        if self.node_count & 511 == 0 && now_ms() > self.deadline {
-            self.incomplete = true;
-            self.cut_short = true;
-            return true;
-        }
-
-        let m = self.lens.len();
-        let mut can_extend = false;
-        for i in 0..m {
-            if self.counts[i] >= self.demands[i] {
-                continue;
-            }
-            let add = (if pieces > 0 { self.kerf } else { 0 }) + self.lens[i];
-            if used + add <= self.usable {
-                can_extend = true;
-                break;
-            }
-        }
-
-        if !can_extend {
-            if pieces > 0 {
-                self.patterns.push(Pattern {
-                    stock: self.stock,
-                    counts: self.counts.clone(),
-                    pieces,
-                    used_um: used,
-                });
-            }
-            return false;
-        }
-
-        for i in start..m {
-            if self.counts[i] >= self.demands[i] {
-                continue;
-            }
-            let add = (if pieces > 0 { self.kerf } else { 0 }) + self.lens[i];
-            if used + add > self.usable {
-                continue;
-            }
-            self.counts[i] += 1;
-            let stop = self.walk(i, used + add, pieces + 1);
-            self.counts[i] -= 1;
-            if stop {
-                return true;
-            }
-        }
-        false
+fn stock_available(left: &Option<u32>) -> bool {
+    match left {
+        None => true,
+        Some(q) => *q > 0,
     }
 }
 
-// ---------------------------------------------------------------------------
-// Greedy incumbent
-// ---------------------------------------------------------------------------
-
-fn greedy_plan(
-    lens: &[i64],
-    demands: &[u32],
-    stocks: &[PrepStock],
-    kerf: i64,
-    min_remnant: i64,
-    mode: Objective,
-) -> Option<Plan> {
-    let m = lens.len();
-    let mut rem = demands.to_vec();
-    let mut left: Vec<Option<u32>> = stocks.iter().map(|s| s.qty).collect();
-    let mut part_order: Vec<usize> = (0..m).collect();
-    part_order.sort_by(|&a, &b| lens[b].cmp(&lens[a]));
-
-    let mut boards: Vec<PlanBoard> = Vec::new();
-    let mut price = 0i64;
-    let mut length = 0i64;
-    let mut offcut_total = 0i64;
-    let mut left_pieces: u64 = demands.iter().map(|&q| q as u64).sum();
-    let guard_limit = left_pieces + 10;
-    let mut guard = 0u64;
-
-    while left_pieces > 0 {
-        guard += 1;
-        if guard > guard_limit {
-            return None;
-        }
-
-        let mut choice: Option<(usize, Vec<u32>, i64)> = None;
-        let mut choice_score = f64::INFINITY;
-
-        for si in 0..stocks.len() {
-            if !stock_available(&left[si]) {
-                continue;
-            }
-            let stock = &stocks[si];
-            let mut counts = vec![0u32; m];
-            let mut temp = rem.clone();
-            let mut used = 0i64;
-            let mut pieces = 0u32;
-            let mut parts_um = 0i64;
-
-            for &i in &part_order {
-                while temp[i] > 0 {
-                    let add = (if pieces > 0 { kerf } else { 0 }) + lens[i];
-                    if used + add > stock.usable_um {
-                        break;
-                    }
-                    counts[i] += 1;
-                    pieces += 1;
-                    used += add;
-                    parts_um += lens[i];
-                    temp[i] -= 1;
-                }
-            }
-            if pieces == 0 {
-                continue;
-            }
-
-            let primary = if mode == Objective::Price {
-                stock.price_cents
-            } else {
-                stock.length_um
-            };
-            let score = primary as f64 / parts_um as f64;
-            if score < choice_score {
-                choice_score = score;
-                choice = Some((si, counts, used));
-            }
-        }
-
-        let (si, counts, used) = choice?;
-        for i in 0..m {
-            rem[i] -= counts[i];
-        }
-        let pieces: u32 = counts.iter().sum();
-        left_pieces -= pieces as u64;
-        take_stock(&mut left[si]);
-        price += stocks[si].price_cents;
-        length += stocks[si].length_um;
-        let board_offcut = stocks[si].usable_um - used;
-        if board_offcut >= min_remnant && board_offcut > 0 {
-            offcut_total += board_offcut;
-        }
-        boards.push(PlanBoard { stock: si, counts });
-    }
-
-    Some(Plan {
-        boards,
-        price,
-        length,
-        offcut: offcut_total,
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Branch and bound
-// ---------------------------------------------------------------------------
-
-#[derive(Default)]
-struct U128Hasher(u64);
-
-impl Hasher for U128Hasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        let mut h = 0xcbf29ce484222325u64;
-        for &b in bytes {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x100000001b3);
-        }
-        self.0 = h;
-    }
-
-    fn write_u128(&mut self, value: u128) {
-        let mut x = (value as u64) ^ ((value >> 64) as u64).rotate_left(29);
-        x ^= x >> 33;
-        x = x.wrapping_mul(0xff51afd7ed558ccd);
-        x ^= x >> 33;
-        self.0 = x;
-    }
-}
-
-type Memo = HashMap<u128, (i64, i64, i64), BuildHasherDefault<U128Hasher>>;
-
-struct Search<'a> {
-    lens: &'a [i64],
-    patterns: &'a [Pattern],
-    by_part: &'a [Vec<usize>],
-    stocks: &'a [PrepStock],
-    mode: Objective,
-    kerf: i64,
-    trim: i64,
-    min_remnant: i64,
-    rem: Vec<u32>,
-    stock_left: Vec<Option<u32>>,
-    stack: Vec<(usize, usize)>,
-    best: Option<Plan>,
-    nodes: u64,
-    timed_out: bool,
-    aborted: bool,
-    deadline: f64,
-    ratio_order: Vec<usize>,
-    memo: Memo,
-    memo_enabled: bool,
-    rem_mult: Vec<u128>,
-    stock_mult: Vec<(usize, u128)>,
-}
-
-impl Search<'_> {
-    fn stock_available(&self, si: usize) -> bool {
-        stock_available(&self.stock_left[si])
-    }
-
-    fn min_price_available(&self) -> Option<i64> {
-        self.stocks
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| self.stock_available(*i))
-            .map(|(_, s)| s.price_cents)
-            .min()
-    }
-
-    fn max_usable_available(&self) -> i64 {
-        self.stocks
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| self.stock_available(*i))
-            .map(|(_, s)| s.usable_um)
-            .max()
-            .unwrap_or(0)
-    }
-
-    fn objective(&self, price: i64, length: i64, offcut: i64) -> (i64, i64, i64) {
-        match self.mode {
-            Objective::Price => (price, length, -offcut),
-            Objective::Waste => (length, price, -offcut),
-        }
-    }
-
-    fn is_better(&self, price: i64, length: i64, offcut: i64) -> bool {
-        let Some(best) = &self.best else {
-            return true;
-        };
-        let current = self.objective(price, length, offcut);
-        let stored = self.objective(best.price, best.length, best.offcut);
-        current < stored
-    }
-
-    /// Mixed-radix code of (remaining parts, remaining limited stock).
-    fn encode_state(&self) -> u128 {
-        let mut code = 0u128;
-        for i in 0..self.rem.len() {
-            let count = self.rem[i];
-            if count > 0 {
-                code += count as u128 * self.rem_mult[i];
-            }
-        }
-        for &(si, mult) in &self.stock_mult {
-            if let Some(q) = self.stock_left[si] {
-                if q > 0 {
-                    code += q as u128 * mult;
-                }
-            }
-        }
-        code
-    }
-
-    fn search(&mut self, acc_price: i64, acc_length: i64, acc_offcut: i64) {
-        self.nodes += 1;
-        if self.nodes & 127 == 0 && now_ms() > self.deadline {
-            self.timed_out = true;
-            self.aborted = true;
-            return;
-        }
-
-        let m = self.lens.len();
-        let mut pick: Option<usize> = None;
-        let mut rem_length: i64 = 0;
-        let mut rem_pieces: u64 = 0;
-        for i in 0..m {
-            let r = self.rem[i];
-            if r > 0 {
-                rem_pieces += r as u64;
-                rem_length += (r as i64) * self.lens[i];
-                if pick.is_none() || self.lens[i] > self.lens[pick.unwrap()] {
-                    pick = Some(i);
-                }
-            }
-        }
-
-        let Some(j) = pick else {
-            if self.is_better(acc_price, acc_length, acc_offcut) {
-                let patterns = self.patterns;
-                let boards = self
-                    .stack
-                    .iter()
-                    .map(|&(si, pi)| PlanBoard {
-                        stock: si,
-                        counts: patterns[pi].counts.clone(),
-                    })
-                    .collect();
-                self.best = Some(Plan {
-                    boards,
-                    price: acc_price,
-                    length: acc_length,
-                    offcut: acc_offcut,
-                });
-            }
-            return;
-        };
-
-        // Exact transposition table: reaching the same residual state with an
-        // equal or worse accumulated objective can never improve the answer.
-        if self.memo_enabled {
-            let code = self.encode_state();
-            let current = self.objective(acc_price, acc_length, acc_offcut);
-            match self.memo.get(&code).copied() {
-                Some(stored) => {
-                    if stored <= current {
-                        return;
-                    }
-                    self.memo.insert(code, current);
-                }
-                None => {
-                    if self.memo.len() < MEMO_CAP {
-                        self.memo.insert(code, current);
-                    }
-                }
-            }
-        }
-
-        // ---- bounds ------------------------------------------------------
-        let stocks = self.stocks;
-        let (primary_lb, secondary_lb) = match self.mode {
-            Objective::Price => {
-                let mut need = rem_length as f64;
-                let mut cost = 0.0f64;
-                for &si in &self.ratio_order {
-                    if need <= 0.0 {
-                        break;
-                    }
-                    if !self.stock_available(si) {
-                        continue;
-                    }
-                    let s = &stocks[si];
-                    let avail = match s.qty {
-                        None => need,
-                        Some(_) => self.stock_left[si].unwrap_or(0) as f64 * s.usable_um as f64,
-                    };
-                    let take = need.min(avail);
-                    cost += take * s.price_cents as f64 / s.usable_um as f64;
-                    need -= take;
-                }
-                if need > 1e-9 {
-                    return;
-                }
-                let Some(min_price) = self.min_price_available() else {
-                    return;
-                };
-                let max_usable = self.max_usable_available();
-                if max_usable <= 0 {
-                    return;
-                }
-                let board_lb = (rem_length as f64 / max_usable as f64).ceil();
-                (cost.max(board_lb * min_price as f64), rem_length as f64)
-            }
-            Objective::Waste => {
-                let max_usable = self.max_usable_available();
-                if max_usable <= 0 {
-                    return;
-                }
-                let board_lb = (rem_length as f64 / max_usable as f64).ceil() as i64;
-                let overhead = self.trim - self.kerf;
-                let best_boards = if overhead >= 0 {
-                    board_lb
-                } else {
-                    rem_pieces as i64
-                };
-                let kerfs = (rem_pieces as i64 - best_boards).max(0);
-                let primary = rem_length + self.kerf * kerfs + best_boards * self.trim;
-                let Some(min_price) = self.min_price_available() else {
-                    return;
-                };
-                (primary as f64, (board_lb * min_price) as f64)
-            }
-        };
-
-        let (total_price_lb, total_length_lb) = match self.mode {
-            Objective::Price => (
-                acc_price as f64 + primary_lb,
-                acc_length as f64 + secondary_lb,
-            ),
-            Objective::Waste => (
-                acc_price as f64 + secondary_lb,
-                acc_length as f64 + primary_lb,
-            ),
-        };
-
-        if let Some(best) = &self.best {
-            let bp = best.price as f64;
-            let bl = best.length as f64;
-            match self.mode {
-                Objective::Price => {
-                    if total_price_lb > bp + 1e-6 {
-                        return;
-                    }
-                    if (total_price_lb - bp).abs() < 1e-6 && total_length_lb > bl + 1e-6 {
-                        return;
-                    }
-                }
-                Objective::Waste => {
-                    if total_length_lb > bl + 1e-6 {
-                        return;
-                    }
-                    if (total_length_lb - bl).abs() < 1e-6 && total_price_lb > bp + 1e-6 {
-                        return;
-                    }
-                }
-            }
-        }
-
-        let patterns = self.patterns;
-        let by_part = self.by_part;
-        let list = &by_part[j];
-
-        for pos in 0..list.len() {
-            let pi = list[pos];
-            let p = &patterns[pi];
-            let stock = &stocks[p.stock];
-            if !self.stock_available(p.stock) {
-                continue;
-            }
-
-            let counts = &p.counts;
-            let mut fits = true;
-            for i in 0..m {
-                if counts[i] > self.rem[i] {
-                    fits = false;
-                    break;
-                }
-            }
-            if !fits {
-                continue;
-            }
-
-            for i in 0..m {
-                if counts[i] > 0 {
-                    self.rem[i] -= counts[i];
-                }
-            }
-            take_stock(&mut self.stock_left[p.stock]);
-            self.stack.push((p.stock, pi));
-
-            let board_offcut = stock.usable_um - p.used_um;
-            let added_offcut = if board_offcut >= self.min_remnant && board_offcut > 0 {
-                board_offcut
-            } else {
-                0
-            };
-
-            self.search(
-                acc_price + stock.price_cents,
-                acc_length + stock.length_um,
-                acc_offcut + added_offcut,
-            );
-
-            self.stack.pop();
-            give_stock(&mut self.stock_left[p.stock]);
-            for i in 0..m {
-                if counts[i] > 0 {
-                    self.rem[i] += counts[i];
-                }
-            }
-
-            if self.aborted {
-                return;
-            }
-        }
+fn take_stock(left: &mut Option<u32>) {
+    if let Some(q) = left.as_mut() {
+        *q -= 1;
     }
 }
