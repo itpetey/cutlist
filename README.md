@@ -166,7 +166,3 @@ scripts/                  benchmark and browser smoke tools
 - Import/export of project files (projects persist in browser storage only).
 - Currency selection (AUD is fixed in the UI; prices are currency-agnostic internally).
 - A browser-independent CLI for the Rust solver.
-
-## Licence
-
-Private project. Add a licence before distributing.
